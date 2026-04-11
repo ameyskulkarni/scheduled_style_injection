@@ -1,0 +1,348 @@
+"""
+ControlNet integration for StyleID.
+
+This module provides:
+1. ControlNet model loading (from diffusers-format checkpoints)
+2. Depth map extraction from content images (using MiDaS)  
+3. ControlNet forward pass that produces residuals for the UNet
+
+Place this file in the root of the StyleID repo (next to run_styleid.py).
+
+Supported condition types (v1.0 ControlNet / SD 1.4):
+  - depth: MiDaS depth estimation (transformers pipeline)
+  - canny: Canny edge detection (OpenCV)
+  - normal: MiDaS surface normals (controlnet_aux MidasDetector)
+  - hed: HED soft edges (controlnet_aux HEDdetector)
+  - seg: ADE20K colored segmentation (controlnet_aux UniformerDetector)
+"""
+
+import torch
+import torch.nn as nn
+import numpy as np
+from PIL import Image
+from enum import Enum
+
+
+class ConditionType(str, Enum):
+    DEPTH = "depth"
+    CANNY = "canny"
+    NORMAL = "normal"
+    SEG = "seg"
+    HED = "hed"
+
+
+# ─────────────────────────────────────────────────
+# 1. Condition extraction (depth map, etc.)
+# ─────────────────────────────────────────────────
+
+def extract_condition(image_np, condition_type="depth", device="cuda", **kwargs):
+    """
+    Extract a condition map from a content image.
+
+    Args:
+        image_np: numpy array, HxWx3, uint8 (RGB)
+        condition_type: one of ConditionType values
+        device: torch device
+    Returns:
+        condition_image: PIL Image (512x512, RGB) ready for ControlNet
+    """
+    if condition_type == ConditionType.DEPTH:
+        return _extract_depth(image_np, device)
+    elif condition_type == ConditionType.CANNY:
+        return _extract_canny(image_np, **kwargs)
+    elif condition_type == ConditionType.NORMAL:
+        return _extract_normal(image_np, device)
+    elif condition_type == ConditionType.HED:
+        return _extract_hed(image_np, device)
+    elif condition_type == ConditionType.SEG:
+        return _extract_seg(image_np, device)
+    else:
+        raise ValueError(f"Unknown condition type: {condition_type}")
+
+
+def _extract_depth(image_np, device="cuda"):
+    """Extract depth map using MiDaS via transformers pipeline."""
+    from transformers import pipeline as hf_pipeline
+    
+    depth_estimator = hf_pipeline('depth-estimation', device=device)
+    pil_img = Image.fromarray(image_np).resize((512, 512))
+    result = depth_estimator(pil_img)
+    depth = result['depth']  # PIL Image, single channel
+    depth = np.array(depth)
+    
+    # Normalize to 0-255
+    depth = (depth - depth.min()) / (depth.max() - depth.min() + 1e-8) * 255
+    depth = depth.astype(np.uint8)
+    
+    # Convert to 3-channel (ControlNet expects RGB)
+    depth_3ch = np.stack([depth, depth, depth], axis=2)
+    
+    del depth_estimator
+    torch.cuda.empty_cache()
+    
+    return Image.fromarray(depth_3ch)
+
+
+def _extract_canny(image_np, low_threshold=100, high_threshold=200):
+    """Extract Canny edges (no GPU needed)."""
+    import cv2
+    img = cv2.resize(image_np, (512, 512))
+    gray = cv2.cvtColor(img, cv2.COLOR_RGB2GRAY)
+    edges = cv2.Canny(gray, low_threshold, high_threshold)
+    edges_3ch = np.stack([edges, edges, edges], axis=2)
+    return Image.fromarray(edges_3ch)
+
+
+def _extract_normal(image_np, device="cuda"):
+    """Extract surface normal map using MiDaS (matched to sd-controlnet-normal v1.0 training format)."""
+    from controlnet_aux import MidasDetector
+
+    detector = MidasDetector.from_pretrained("lllyasviel/Annotators")
+    pil_img = Image.fromarray(image_np).resize((512, 512))
+    _, normal = detector(pil_img, depth_and_normal=True)
+    del detector
+    torch.cuda.empty_cache()
+    if not isinstance(normal, Image.Image):
+        normal = Image.fromarray(normal)
+    return normal.resize((512, 512))
+
+
+def _extract_hed(image_np, device="cuda"):
+    """Extract HED soft edges (matched to sd-controlnet-hed v1.0 training format)."""
+    from controlnet_aux import HEDdetector
+
+    detector = HEDdetector.from_pretrained("lllyasviel/Annotators")
+    pil_img = Image.fromarray(image_np).resize((512, 512))
+    result = detector(pil_img)
+    del detector
+    torch.cuda.empty_cache()
+    if not isinstance(result, Image.Image):
+        result = Image.fromarray(result)
+    return result.resize((512, 512))
+
+
+def _extract_seg(image_np, device="cuda"):
+    """Extract ADE20K colored segmentation map using SegFormer (matched to sd-controlnet-seg v1.0 training format)."""
+    import torch.nn.functional as F
+    from transformers import SegformerImageProcessor, SegformerForSemanticSegmentation
+
+    processor = SegformerImageProcessor.from_pretrained("nvidia/segformer-b5-finetuned-ade-640-640")
+    model = SegformerForSemanticSegmentation.from_pretrained("nvidia/segformer-b5-finetuned-ade-640-640")
+    model.to(device).eval()
+
+    pil_img = Image.fromarray(image_np).resize((512, 512))
+    inputs = processor(images=pil_img, return_tensors="pt")
+    inputs = {k: v.to(device) for k, v in inputs.items()}
+
+    with torch.no_grad():
+        outputs = model(**inputs)
+
+    # Upsample logits to 512x512 and get per-pixel class predictions
+    logits = F.interpolate(outputs.logits, size=(512, 512), mode="bilinear", align_corners=False)
+    seg_map = logits.argmax(dim=1).squeeze().cpu().numpy()  # (512, 512) uint class indices
+
+    # Apply ADE20K color palette (same mapping used during sd-controlnet-seg training)
+    palette = np.array(_ADE20K_PALETTE, dtype=np.uint8)
+    seg_rgb = palette[seg_map]  # (512, 512, 3)
+
+    del model
+    torch.cuda.empty_cache()
+
+    return Image.fromarray(seg_rgb)
+
+
+# ADE20K 150-class color palette (from mmsegmentation ADE20KDataset, matches ControlNet seg training)
+_ADE20K_PALETTE = [
+    [120, 120, 120], [180, 120, 120], [6, 230, 230],   [80, 50, 50],
+    [4, 200, 3],     [120, 120, 80],  [140, 140, 140], [204, 5, 255],
+    [230, 230, 230], [4, 250, 7],     [224, 5, 255],   [235, 255, 7],
+    [150, 5, 61],    [120, 120, 70],  [8, 255, 51],    [255, 6, 82],
+    [143, 255, 140], [204, 255, 4],   [255, 51, 7],    [204, 70, 3],
+    [0, 102, 200],   [61, 230, 250],  [255, 6, 51],    [11, 102, 255],
+    [255, 7, 71],    [255, 9, 224],   [9, 7, 230],     [220, 220, 220],
+    [255, 9, 92],    [112, 9, 255],   [8, 255, 214],   [7, 255, 224],
+    [255, 184, 6],   [10, 255, 71],   [255, 41, 10],   [7, 255, 255],
+    [224, 255, 8],   [102, 8, 255],   [255, 61, 6],    [255, 194, 7],
+    [255, 122, 8],   [0, 255, 20],    [255, 8, 41],    [255, 5, 153],
+    [6, 51, 255],    [235, 12, 255],  [160, 150, 20],  [0, 163, 255],
+    [140, 140, 140], [250, 10, 15],   [20, 255, 0],    [31, 255, 0],
+    [255, 31, 0],    [255, 224, 0],   [153, 255, 0],   [0, 0, 255],
+    [255, 71, 0],    [0, 235, 255],   [0, 173, 255],   [31, 0, 255],
+    [11, 200, 200],  [255, 82, 0],    [0, 255, 245],   [0, 61, 255],
+    [0, 255, 112],   [0, 255, 133],   [255, 0, 0],     [255, 163, 0],
+    [255, 102, 0],   [194, 255, 0],   [0, 143, 255],   [51, 255, 0],
+    [0, 82, 255],    [0, 255, 41],    [0, 255, 173],   [10, 0, 255],
+    [173, 255, 0],   [0, 255, 153],   [255, 92, 0],    [255, 0, 255],
+    [255, 0, 245],   [255, 0, 102],   [255, 173, 0],   [255, 0, 20],
+    [255, 184, 184], [0, 31, 255],    [0, 255, 61],    [0, 71, 255],
+    [255, 0, 204],   [0, 255, 194],   [0, 255, 82],    [0, 10, 255],
+    [0, 112, 255],   [51, 0, 255],    [0, 194, 255],   [0, 122, 255],
+    [0, 255, 163],   [255, 153, 0],   [0, 255, 10],    [255, 112, 0],
+    [143, 255, 0],   [82, 0, 255],    [163, 255, 0],   [255, 235, 0],
+    [8, 184, 170],   [133, 0, 255],   [0, 255, 92],    [184, 0, 255],
+    [255, 0, 31],    [0, 184, 255],   [0, 214, 255],   [255, 0, 112],
+    [92, 255, 0],    [0, 224, 255],   [112, 224, 255], [70, 184, 160],
+    [163, 0, 255],   [153, 0, 255],   [71, 255, 0],    [255, 0, 163],
+    [255, 204, 0],   [255, 0, 143],   [0, 255, 235],   [133, 255, 0],
+    [255, 0, 235],   [245, 0, 255],   [255, 0, 122],   [255, 245, 0],
+    [10, 190, 212],  [214, 255, 0],   [0, 204, 255],   [20, 0, 255],
+    [255, 255, 0],   [0, 153, 255],   [0, 41, 255],    [0, 255, 204],
+    [41, 0, 255],    [41, 255, 0],    [173, 0, 255],   [0, 245, 255],
+    [71, 0, 255],    [122, 0, 255],   [0, 255, 184],   [0, 92, 255],
+    [184, 255, 0],   [0, 133, 255],   [255, 214, 0],   [25, 194, 194],
+    [102, 255, 0],   [92, 0, 255],
+]
+
+
+# ─────────────────────────────────────────────────
+# 2. ControlNet model wrapper (for original LDM codebase)
+# ─────────────────────────────────────────────────
+
+class ControlNetWrapper:
+    """
+    Loads a ControlNet from HuggingFace diffusers format and runs it
+    to produce residuals that are added to the SD UNet's skip connections.
+    
+    ControlNet architecture: 
+      - Copies the encoder half of the UNet (input_blocks + middle_block)
+      - Adds zero_convs after each block
+      - Produces residuals for each skip connection + middle block
+      
+    Integration with StyleID's LDM UNet:
+      - The residuals are added to `hs` (skip connections) before the decoder uses them
+      - The middle block residual is added to `h` after middle_block
+    """
+    
+    def __init__(self, controlnet_model_id, device="cuda", dtype=torch.float16):
+        """
+        Args:
+            controlnet_model_id: HuggingFace model ID, e.g. "lllyasviel/sd-controlnet-depth"
+            device: torch device
+            dtype: precision
+        """
+        from diffusers import ControlNetModel
+        
+        print(f"Loading ControlNet from {controlnet_model_id}...")
+        self.controlnet = ControlNetModel.from_pretrained(
+            controlnet_model_id, torch_dtype=dtype
+        )
+        self.controlnet.to(device)
+        self.controlnet.eval()
+        self.device = device
+        self.dtype = dtype
+        print("ControlNet loaded.")
+    
+    def prepare_condition(self, condition_image, device=None, dtype=None):
+        """
+        Convert a PIL condition image to the tensor format ControlNet expects.
+        
+        Args:
+            condition_image: PIL Image (512x512, RGB)
+        Returns:
+            condition_tensor: [1, 3, 512, 512] normalized to [0, 1]
+        """
+        if device is None:
+            device = self.device
+        if dtype is None:
+            dtype = self.dtype
+            
+        img = condition_image.resize((512, 512))
+        img = np.array(img).astype(np.float32) / 255.0
+        img = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0)
+        return img.to(device=device, dtype=dtype)
+    
+    def get_residuals(self, sample, timestep, encoder_hidden_states, controlnet_cond,
+                      conditioning_scale=1.0, layer_scales=None):
+        """
+        Run ControlNet forward pass to get residuals.
+
+        Args:
+            sample: noisy latent [B, 4, 64, 64]
+            timestep: current timestep (scalar or tensor)
+            encoder_hidden_states: text conditioning [B, 77, 768]
+            controlnet_cond: condition image tensor [B, 3, 512, 512]
+            conditioning_scale: uniform strength of ControlNet influence (used when layer_scales is None)
+            layer_scales: optional list of per-layer floats. When provided, conditioning_scale is
+                          ignored and each residual is multiplied by its corresponding entry.
+                          Indices 0..N-2 correspond to down_block_res_samples, index N-1 to mid_block.
+
+        Returns:
+            down_block_res_samples: list of tensors for skip connections
+            mid_block_res_sample: tensor for middle block
+        """
+        with torch.no_grad():
+            result = self.controlnet(
+                sample=sample,
+                timestep=timestep,
+                encoder_hidden_states=encoder_hidden_states,
+                controlnet_cond=controlnet_cond,
+                conditioning_scale=1.0 if layer_scales is not None else conditioning_scale,
+                return_dict=True,
+            )
+
+        down_block_res_samples = list(result.down_block_res_samples)
+        mid_block_res_sample = result.mid_block_res_sample
+
+        if layer_scales is not None:
+            n_down = len(down_block_res_samples)
+            for i in range(n_down):
+                if i < len(layer_scales):
+                    down_block_res_samples[i] = down_block_res_samples[i] * layer_scales[i]
+            mid_idx = n_down
+            if mid_idx < len(layer_scales):
+                mid_block_res_sample = mid_block_res_sample * layer_scales[mid_idx]
+
+        return down_block_res_samples, mid_block_res_sample
+    
+    def to_cpu(self):
+        """Move ControlNet to CPU to free VRAM."""
+        self.controlnet.to("cpu")
+        torch.cuda.empty_cache()
+    
+    def to_device(self):
+        """Move ControlNet back to GPU."""
+        self.controlnet.to(self.device)
+
+
+# ─────────────────────────────────────────────────
+# 3. Model ID mapping for different condition types
+# ─────────────────────────────────────────────────
+
+CONTROLNET_MODEL_IDS = {
+    ConditionType.DEPTH: "lllyasviel/sd-controlnet-depth",
+    ConditionType.CANNY: "lllyasviel/sd-controlnet-canny",
+    ConditionType.NORMAL: "lllyasviel/sd-controlnet-normal",
+    ConditionType.SEG: "lllyasviel/sd-controlnet-seg",
+    ConditionType.HED: "lllyasviel/sd-controlnet-hed",
+}
+
+CONTROLNET_V11_MODEL_IDS = {
+    ConditionType.DEPTH: "lllyasviel/control_v11f1p_sd15_depth",
+    ConditionType.CANNY: "lllyasviel/control_v11p_sd15_canny",
+    ConditionType.NORMAL: "lllyasviel/control_v11p_sd15_normalbae",
+    ConditionType.SEG: "lllyasviel/control_v11p_sd15_seg",
+    ConditionType.HED: "lllyasviel/control_v11p_sd15_softedge",
+}
+
+CONTROLNET_SD21_MODEL_IDS = {
+    ConditionType.DEPTH: "thibaud/controlnet-sd21-depth-diffusers",
+    ConditionType.CANNY: "thibaud/controlnet-sd21-canny-diffusers",
+    ConditionType.NORMAL: "thibaud/controlnet-sd21-normal-diffusers",
+    ConditionType.SEG: "thibaud/controlnet-sd21-seg-diffusers",
+    ConditionType.HED: "thibaud/controlnet-sd21-hed-diffusers",
+}
+
+
+def get_controlnet_model_id(condition_type, version="1.0", sd_version="1"):
+    """Get the HuggingFace model ID for a given condition type.
+
+    Args:
+        condition_type: ConditionType enum value
+        version: ControlNet version ("1.0" or "1.1") — only applies to SD 1.x
+        sd_version: SD base model version ("1" for SD 1.4/1.5, "2" for SD 2.1)
+    """
+    if sd_version == "2":
+        return CONTROLNET_SD21_MODEL_IDS[condition_type]
+    if version == "1.1":
+        return CONTROLNET_V11_MODEL_IDS[condition_type]
+    return CONTROLNET_MODEL_IDS[condition_type]
