@@ -197,6 +197,8 @@ python run_styleid.py \
 | `--precomputed` | `./precomputed_feats` | Cache directory for DDIM inversion features (set to `""` to disable) |
 | `--sd_version` | — | `1.4`, `1.5`, or `2.1` — auto-sets config and checkpoint paths |
 
+For the full ControlNet per-layer scheduling API, layer index reference, and implementation notes see **[docs/controlnet_scheduling.md](docs/controlnet_scheduling.md)**.
+
 ### Precomputed Feature Cache
 
 By default, DDIM inversion features are cached to `precomputed_feats/` (saves ~3 GB per image but eliminates re-inversion on subsequent runs). To disable:

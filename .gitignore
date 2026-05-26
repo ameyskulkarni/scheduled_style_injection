@@ -1,0 +1,41 @@
+# IDE
+.idea/
+.vscode/
+*.iml
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# Model weights and checkpoints
+*.ckpt
+*.safetensors
+*.pth
+*.pt
+weights/
+
+# Large precomputed artifacts
+precomputed_feats/
+*.pkl
+
+# Generated outputs
+output/
+outputs/
+
+# LaTeX source (paper source, not needed for code users)
+author-kit-CVPR2026-v1-latex-/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Logs
+*.log
+*.txt.bak

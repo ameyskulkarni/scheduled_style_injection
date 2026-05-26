@@ -1,4 +1,4 @@
-name: StyleID
+name: scheduled_style_injection
 channels:
   - pytorch
   - defaults
